@@ -2,10 +2,9 @@
 import sys
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
-import os
 
 # Global variables
-GEMINI_API_KEY = os.environ['GOOGLE_API_KEY']
+GEMINI_API_KEY = None
 ROOT_DIRECTORY = None
 
 # Create an MCP server
@@ -32,8 +31,10 @@ def main():
         print("Usage: python server.py <gemini_api_key> <root_directory>")
         sys.exit(1)
     
-    ROOT_DIRECTORY = Path(sys.argv[1])
+    GEMINI_API_KEY = sys.argv[1]
+    ROOT_DIRECTORY = Path(sys.argv[2])
     
+    print(f"Gemini API Key: {GEMINI_API_KEY}")
     print(f"Root Directory: {ROOT_DIRECTORY}")
     
     mcp.run()
