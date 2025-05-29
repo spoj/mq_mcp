@@ -37,6 +37,7 @@ Remember: Be thorough, avoid assumptions, and use multiple queries if needed to 
 
 import asyncio
 import json
+import logging
 import mimetypes
 import random
 import re
@@ -47,7 +48,12 @@ from google import genai
 from google.genai import types
 from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent, EmbeddedResource, Resource
+from pydantic import AnyUrl
 from tenacity import retry, stop_after_attempt
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger('mcp_file_query_server')
 
 # Constants
 MAX_CONCURRENT_TASKS = 50
@@ -59,6 +65,37 @@ OVERVIEW_FILENAME = "_OVERVIEW.json"
 # Initialize FastMCP server
 mcp = FastMCP("file-query-server")
 
+# Prompt templates
+ANALYSIS_PROMPT_TEMPLATE = """
+You are analyzing files in a directory using the File Query MCP Server.
+
+Analysis Focus: {focus}
+Directory: {directory}
+
+Please follow this systematic approach:
+
+1. **Initial Discovery**
+   - Use 'get_overview' to understand the general content of files
+   - Use 'directory_tree' to see the structure and file organization
+
+2. **Targeted Analysis**
+   - Use 'map_query_tool' with specific files for detailed information
+   - Use 'map_query_tool_regex' to filter by file patterns
+   - Use 'map_query_tool_regex_sampled' for sampling large sets
+
+3. **Deep Investigation**
+   - Access individual files via resources for detailed examination
+   - Cross-reference information between files
+   - Look for patterns, inconsistencies, or missing information
+
+4. **Synthesis**
+   - Combine findings from all sources
+   - Provide comprehensive insights based on the analysis
+
+Focus your analysis on: {focus}
+
+Start by getting an overview of the directory structure and contents.
+"""
 
 class FileQueryService:
     def __init__(self, root_directory: str):
@@ -67,6 +104,8 @@ class FileQueryService:
             raise ValueError(f"Directory {root_directory} does not exist")
         if not self.root_directory.is_dir():
             raise ValueError(f"{root_directory} is not a directory")
+        
+        logger.info(f"Initialized FileQueryService for directory: {self.root_directory}")
 
     def file_to_part(self, file_path: Path) -> types.Part | None:
         """Convert file to Gemini Part object."""
@@ -86,8 +125,10 @@ class FileQueryService:
     ) -> str:
         """Process a single file against the query using Gemini."""
         try:
+            logger.debug(f"Processing file: {file_path}")
             part = self.file_to_part(file_path)
             if part is None:
+                logger.warning(f"Could not read file: {file_path}")
                 return f"Error: Could not read file {file_path}"
 
             messages = [
@@ -105,8 +146,11 @@ class FileQueryService:
                     thinking_config=types.ThinkingConfig(thinking_budget=0),
                 ),
             )
-            return response.candidates[0].content.parts[0].text
+            result = response.candidates[0].content.parts[0].text
+            logger.debug(f"Successfully processed file: {file_path}")
+            return result
         except Exception as e:
+            logger.error(f"Error processing file {file_path}: {e}")
             return f"Error processing file {file_path}: {e}"
 
     def directory_tree_full(self) -> Iterator[str]:
@@ -122,6 +166,8 @@ class FileQueryService:
 
     async def map_query_files(self, query: str, filenames: list[str]) -> dict[str, str]:
         """Process multiple files concurrently with a query."""
+        logger.info(f"Processing {len(filenames)} files with query: {query[:50]}...")
+        
         if not isinstance(filenames, list):
             return {"error": "Filenames must be a list of strings"}
 
@@ -132,7 +178,10 @@ class FileQueryService:
                 target_files.append(file_path)
 
         if not target_files:
+            logger.warning("No valid target files found")
             return {"error": "No valid target files found"}
+
+        logger.info(f"Found {len(target_files)} valid files to process")
 
         # Process files concurrently
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
@@ -150,13 +199,17 @@ class FileQueryService:
 
         # Format results
         result_dict = {}
+        success_count = 0
         for i, result in enumerate(results):
             relative_path = str(target_files[i].relative_to(self.root_directory))
             if isinstance(result, Exception):
                 result_dict[relative_path] = f"Task failed: {result}"
+                logger.error(f"Failed to process {relative_path}: {result}")
             else:
                 result_dict[relative_path] = result
+                success_count += 1
 
+        logger.info(f"Successfully processed {success_count}/{len(target_files)} files")
         return result_dict
 
 
@@ -318,6 +371,91 @@ async def get_overview() -> str:
         print(f"Error saving overview: {e}")
 
     return json.dumps(result, indent=2)
+
+
+@mcp.resource("file://{path}")
+async def read_file_resource(path: str) -> str:
+    """
+    Read a file from the configured directory as a resource.
+    
+    Args:
+        path: Relative path to the file from the configured directory
+    """
+    if service is None:
+        return "Error: Server not configured with a directory"
+    
+    try:
+        file_path = service.root_directory / path
+        if not file_path.is_file():
+            return f"Error: {path} is not a file or does not exist"
+        
+        if not file_path.is_relative_to(service.root_directory):
+            return "Error: Access denied - path outside configured directory"
+        
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+        
+        logger.info(f"Read file resource: {path}")
+        return content
+    except Exception as e:
+        logger.error(f"Error reading file resource {path}: {e}")
+        return f"Error reading file: {e}"
+
+
+@mcp.resource("overview://directory")
+async def overview_resource() -> str:
+    """
+    Get the directory overview as a resource.
+    """
+    if service is None:
+        return "Error: Server not configured with a directory"
+    
+    try:
+        overview_path = service.root_directory / OVERVIEW_FILENAME
+        
+        # Try to load existing overview
+        try:
+            with open(overview_path, "r") as f:
+                overview_data = json.load(f)
+            return json.dumps(overview_data, indent=2)
+        except Exception:
+            # Generate new overview if not available
+            all_files = list(service.directory_tree_full())
+            random.shuffle(all_files)
+            selected_files = all_files[:OVERVIEW_MAX_FILES]
+            
+            result = await service.map_query_files(
+                "give overview. Use dense langauge so that fewest words carry most meaning.",
+                selected_files
+            )
+            
+            # Save overview
+            try:
+                with open(overview_path, "w") as f:
+                    json.dump(result, f, indent=4)
+            except Exception as e:
+                logger.error(f"Error saving overview: {e}")
+            
+            return json.dumps(result, indent=2)
+    except Exception as e:
+        logger.error(f"Error generating overview resource: {e}")
+        return f"Error: {e}"
+
+
+@mcp.prompt()
+async def file_analysis_prompt(focus: str = "general analysis") -> str:
+    """
+    A prompt template for systematic file analysis.
+    
+    Args:
+        focus: The specific focus area for the analysis
+    """
+    if service is None:
+        directory = "Not configured"
+    else:
+        directory = str(service.root_directory)
+    
+    return ANALYSIS_PROMPT_TEMPLATE.format(focus=focus, directory=directory)
 
 
 def main():
