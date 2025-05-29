@@ -1,3 +1,40 @@
+"""
+MCP File Query Server
+
+This server provides tools for querying files in a directory using LLMs:
+ - 'directory_tree' recursively lists all files in the dir
+ - 'ls' tool lists one level of a specified path. this is useful for iteratively exploring files when the directory contains too many files for the 'directory_tree' tool.
+ - 'map_query_tool' runs a query against all files specified
+ - 'map_query_tool_regex' is similar to 'map_query_tool' except it runs the query against all files whose filename matches a regex
+ - 'map_query_tool_regex_sampled' is similar to 'map_query_tool_regex' except it takes a random sample (without replacement) of at most sample_size
+ - 'get_overview' extracts a brief overview of at most 100 files in the directory. If number of files >100, then a random sample of files is chosen.
+
+Systematic Methodology:
+
+1. **Initial Discovery**
+   - Use 'get_overview' to understand the general content of files
+   - Use 'directory_tree' to see the structure and file organization
+   - Note if the directory is large (>100 files) as overview will be sampled
+
+2. **Targeted Analysis**
+   - Use 'map_query_tool' with specific files to gather detailed information
+   - For large directories, use 'map_query_tool_regex' to filter by file patterns
+   - Use 'map_query_tool_regex_sampled' for sampling if there are many matches
+   - Run multiple queries from different angles to be thorough
+
+3. **Deep Investigation**
+   - For specific files of interest, read them directly using the file resources
+   - Cross-reference information between files
+   - Look for patterns, inconsistencies, or missing information
+
+4. **Synthesis**
+   - Combine findings from all sources
+   - If information is incomplete, ask clarifying questions
+   - Provide a comprehensive answer based on the evidence found
+
+Remember: Be thorough, avoid assumptions, and use multiple queries if needed to get complete information.
+"""
+
 import asyncio
 import json
 import mimetypes
@@ -16,7 +53,7 @@ from tenacity import retry, stop_after_attempt
 MAX_CONCURRENT_TASKS = 50
 MODEL_NAME = "gemini-2.5-flash-preview-05-20"
 MAX_FILES_FOR_DIR_TREE = 100
-OVERVIEW_MAX_FILES = 50
+OVERVIEW_MAX_FILES = 100
 OVERVIEW_FILENAME = "_OVERVIEW.json"
 
 # Initialize FastMCP server
@@ -55,7 +92,7 @@ class FileQueryService:
 
             messages = [
                 part,
-                "answer the following query about the preceding file",
+                "answer the following query about the preceding file. Use dense language to convey the most using fewest words. Your answer must be grounded in the document.",
                 query,
             ]
 
@@ -271,7 +308,7 @@ async def get_overview() -> str:
     random.shuffle(all_files)
     selected_files = all_files[:OVERVIEW_MAX_FILES]
 
-    result = await service.map_query_files("brief overview", selected_files)
+    result = await service.map_query_files("give overview. Use dense langauge so that fewest words carry most meaning.", selected_files)
 
     # Save overview
     try:
